@@ -1,0 +1,327 @@
+name: '42-Challenge Evaluator'
+description: 'Evaluates backend and frontend implementations against the 42-Challenge specification'
+
+inputs:
+  backend-url:
+    description: 'URL of the backend to evaluate'
+    required: false
+    default: 'http://localhost:3000'
+  frontend-url:
+    description: 'URL of the frontend to evaluate (leave empty to skip FE eval)'
+    required: false
+    default: 'http://localhost:5173'
+  fe-enabled:
+    description: 'Whether to run frontend evaluation'
+    required: false
+    default: 'true'
+  team:
+    description: 'Team name for results'
+    required: false
+    default: 'anonymous'
+  launch-secret:
+    description: 'HMAC secret for Trial VII verification'
+    required: false
+    default: 'default-secret-change-me'
+  concurrency:
+    description: 'Number of concurrent goroutines for stress test'
+    required: false
+    default: '50'
+  rounds:
+    description: 'Number of rounds per goroutine in stress test'
+    required: false
+    default: '100'
+
+outputs:
+  score:
+    description: 'Backend base score achieved'
+    value: ${{ steps.extract.outputs.score }}
+  max-score:
+    description: 'Backend maximum possible base score'
+    value: ${{ steps.extract.outputs.max_score }}
+  bonus:
+    description: 'Backend bonus points achieved'
+    value: ${{ steps.extract.outputs.bonus }}
+  grand-total:
+    description: 'Backend grand total (base + bonus)'
+    value: ${{ steps.extract.outputs.grand_total }}
+  results-path:
+    description: 'Path to results.json'
+    value: ${{ steps.run.outputs.results_path }}
+  fe-score:
+    description: 'Frontend base score achieved'
+    value: ${{ steps.fe-extract.outputs.fe_score }}
+  fe-max-score:
+    description: 'Frontend maximum possible base score'
+    value: ${{ steps.fe-extract.outputs.fe_max_score }}
+  fe-bonus:
+    description: 'Frontend bonus points achieved'
+    value: ${{ steps.fe-extract.outputs.fe_bonus }}
+  fe-grand-total:
+    description: 'Frontend grand total (base + bonus)'
+    value: ${{ steps.fe-extract.outputs.fe_grand_total }}
+
+runs:
+  using: 'composite'
+  steps:
+
+    # ── Backend evaluation ────────────────────────────────────────────────────
+
+    - name: Run backend evaluator
+      id: run
+      shell: bash
+      run: |
+        chmod +x ${{ github.action_path }}/evaluator
+        ${{ github.action_path }}/evaluator \
+          -url "${{ inputs.backend-url }}" \
+          -team "${{ inputs.team }}" \
+          -secret "${{ inputs.launch-secret }}" \
+          -concurrency "${{ inputs.concurrency }}" \
+          -rounds "${{ inputs.rounds }}" \
+          -output results.json
+        echo "results_path=${{ github.workspace }}/results.json" >> "$GITHUB_OUTPUT"
+
+    - name: Extract backend scores
+      id: extract
+      shell: bash
+      run: |
+        echo "score=$(jq -r '.summary.total' results.json)" >> "$GITHUB_OUTPUT"
+        echo "max_score=$(jq -r '.summary.maxTotal' results.json)" >> "$GITHUB_OUTPUT"
+        echo "bonus=$(jq -r '.summary.bonus' results.json)" >> "$GITHUB_OUTPUT"
+        echo "grand_total=$(jq -r '.summary.grandTotal' results.json)" >> "$GITHUB_OUTPUT"
+
+    # ── Frontend evaluation ───────────────────────────────────────────────────
+
+    - name: Probe frontend availability
+      id: fe-probe
+      if: inputs.fe-enabled == 'true'
+      shell: bash
+      run: |
+        if curl -sf --max-time 8 "${{ inputs.frontend-url }}" > /dev/null 2>&1; then
+          echo "Frontend is reachable at ${{ inputs.frontend-url }}"
+          echo "frontend_available=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Frontend not reachable at ${{ inputs.frontend-url }} — skipping FE eval"
+          echo "frontend_available=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Setup Node.js for frontend eval
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      uses: actions/setup-node@v6
+      continue-on-error: true
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: ${{ github.action_path }}/frontend-eval/package-lock.json
+
+    - name: Install frontend eval dependencies
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}/frontend-eval"
+        npm ci
+
+    - name: Install Playwright browsers
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}/frontend-eval"
+        npx playwright install chromium --with-deps
+
+    - name: Run Playwright frontend tests
+      id: fe-playwright
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      shell: bash
+      env:
+        FRONTEND_URL: ${{ inputs.frontend-url }}
+        FRONTEND_AVAILABLE: 'true'
+        TEAM: ${{ inputs.team }}
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+      run: |
+        cd "${{ github.action_path }}/frontend-eval"
+        npx playwright test 2>&1 || true
+        echo "fe_results_path=${{ github.workspace }}/frontend-results.json" >> "$GITHUB_OUTPUT"
+
+    - name: Run Lighthouse CI
+      id: fe-lighthouse
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      shell: bash
+      run: |
+        cd "${{ github.action_path }}/frontend-eval"
+
+        # Discover Playwright-installed Chromium
+        CHROME_PATH=$(node -e "
+          const { execSync } = require('child_process');
+          try {
+            const out = execSync('npx playwright chromium-executable 2>/dev/null', { encoding: 'utf8' });
+            process.stdout.write(out.trim());
+          } catch {
+            process.stdout.write('');
+          }
+        " 2>/dev/null || true)
+
+        LHCI_FLAGS="--url=${{ inputs.frontend-url }} --numberOfRuns=1"
+        CHROME_FLAGS="--no-sandbox --disable-dev-shm-usage --disable-gpu"
+
+        if [ -n "$CHROME_PATH" ] && [ -f "$CHROME_PATH" ]; then
+          CHROME_PATH="$CHROME_PATH" \
+            npx lhci collect $LHCI_FLAGS \
+              --settings.chromeFlags="$CHROME_FLAGS" \
+              --config=lighthouserc.json 2>&1 || true
+        else
+          npx lhci collect $LHCI_FLAGS \
+            --settings.chromeFlags="$CHROME_FLAGS" \
+            --config=lighthouserc.json 2>&1 || true
+        fi
+
+        # Parse the LHR output and write lh-scores.json
+        node -e "
+          const fs = require('fs');
+          const dir = '.lighthouseci';
+          if (!fs.existsSync(dir)) {
+            fs.writeFileSync('${{ github.workspace }}/lh-scores.json', JSON.stringify({ accessibility: 0, performance: 0 }));
+            process.exit(0);
+          }
+          const files = fs.readdirSync(dir).filter(f => f.startsWith('lhr-') && f.endsWith('.json'));
+          if (files.length === 0) {
+            fs.writeFileSync('${{ github.workspace }}/lh-scores.json', JSON.stringify({ accessibility: 0, performance: 0 }));
+            process.exit(0);
+          }
+          const lhr = JSON.parse(fs.readFileSync(dir + '/' + files[0], 'utf8'));
+          const scores = {
+            accessibility: Math.round((lhr.categories?.accessibility?.score ?? 0) * 100),
+            performance: Math.round((lhr.categories?.performance?.score ?? 0) * 100),
+          };
+          fs.writeFileSync('${{ github.workspace }}/lh-scores.json', JSON.stringify(scores));
+          console.log('Lighthouse scores:', JSON.stringify(scores));
+        " || echo '{"accessibility":0,"performance":0}' > "${{ github.workspace }}/lh-scores.json"
+
+    - name: Merge Lighthouse scores into frontend-results.json
+      if: inputs.fe-enabled == 'true' && steps.fe-probe.outputs.frontend_available == 'true'
+      shell: bash
+      run: |
+        node "${{ github.action_path }}/frontend-eval/scripts/merge-lh-scores.js" \
+          "${{ github.workspace }}/frontend-results.json" \
+          "${{ github.workspace }}/lh-scores.json"
+
+    - name: Write skipped frontend-results.json
+      if: inputs.fe-enabled == 'false' || steps.fe-probe.outputs.frontend_available == 'false'
+      shell: bash
+      run: |
+        printf '%s\n' \
+          '{"evaluator":"42-challenge-frontend","version":"1.0.0","skipped":true,' \
+          '"summary":{"total":0,"maxTotal":95,"bonus":0,"grandTotal":0,"maxGrandTotal":105},' \
+          '"trials":[],' \
+          '"boss":{"name":"The Lighthouse Sentinel","points":0,"maxPoints":10,"passed":false,"detail":"skipped"}}' \
+          | tr -d '\n' > "${{ github.workspace }}/frontend-results.json"
+
+    - name: Extract frontend scores
+      id: fe-extract
+      if: always()
+      shell: bash
+      run: |
+        if [ -f "${{ github.workspace }}/frontend-results.json" ]; then
+          echo "fe_score=$(jq -r '.summary.total // 0' "${{ github.workspace }}/frontend-results.json")" >> "$GITHUB_OUTPUT"
+          echo "fe_max_score=$(jq -r '.summary.maxTotal // 95' "${{ github.workspace }}/frontend-results.json")" >> "$GITHUB_OUTPUT"
+          echo "fe_bonus=$(jq -r '.summary.bonus // 0' "${{ github.workspace }}/frontend-results.json")" >> "$GITHUB_OUTPUT"
+          echo "fe_grand_total=$(jq -r '.summary.grandTotal // 0' "${{ github.workspace }}/frontend-results.json")" >> "$GITHUB_OUTPUT"
+        else
+          echo "fe_score=0" >> "$GITHUB_OUTPUT"
+          echo "fe_max_score=95" >> "$GITHUB_OUTPUT"
+          echo "fe_bonus=0" >> "$GITHUB_OUTPUT"
+          echo "fe_grand_total=0" >> "$GITHUB_OUTPUT"
+        fi
+
+    # ── Artifacts ─────────────────────────────────────────────────────────────
+
+    - name: Upload results artifacts
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: evaluator-results-${{ inputs.team }}
+        path: |
+          results.json
+          frontend-results.json
+
+    # ── PR comment ────────────────────────────────────────────────────────────
+
+    - name: Post PR comment
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        TEAM="${{ inputs.team }}"
+        COMMENT_FILE="$(mktemp)"
+
+        # ── Backend section ──────────────────────────────────────────────────
+        BE_TOTAL=$(jq -r '.summary.total' results.json)
+        BE_MAX=$(jq -r '.summary.maxTotal' results.json)
+        BE_BONUS=$(jq -r '.summary.bonus' results.json)
+        BE_GRAND=$(jq -r '.summary.grandTotal' results.json)
+        P95=$(jq -r '.stress.p95Ms // "N/A"' results.json)
+        BOSS_PASSED=$(jq -r '.boss.passed // false' results.json)
+        BE_BOSS_NAME=$(jq -r '.boss.name // "The Load Warden"' results.json)
+        if [ "$BOSS_PASSED" = "true" ]; then BE_BOSS="DEFEATED (+10)"; else BE_BOSS="survived"; fi
+
+        printf '## 42-Challenge Evaluation — %s\n\n' "$TEAM" > "$COMMENT_FILE"
+        printf '---\n\n' >> "$COMMENT_FILE"
+        printf '### Backend: %s/%s + %s bonus = **%s**\n\n' \
+          "$BE_TOTAL" "$BE_MAX" "$BE_BONUS" "$BE_GRAND" >> "$COMMENT_FILE"
+        printf '| Trial | Score | Status |\n' >> "$COMMENT_FILE"
+        printf '|-------|-------|--------|\n' >> "$COMMENT_FILE"
+
+        jq -r '.trials[] | [.trial, .name, (.score|tostring), (.maxScore|tostring)] | @tsv' \
+          results.json | while IFS=$'\t' read -r TRIAL NAME SCORE MAX_SCORE; do
+          if [ "$SCORE" = "$MAX_SCORE" ]; then STATUS="PASS"; else STATUS="PARTIAL"; fi
+          printf '| %s — %s | %s/%s | %s |\n' "$TRIAL" "$NAME" "$SCORE" "$MAX_SCORE" "$STATUS" >> "$COMMENT_FILE"
+        done
+
+        printf '\nStress test: p95 = %sms | Boss (%s): %s\n\n' \
+          "$P95" "$BE_BOSS_NAME" "$BE_BOSS" >> "$COMMENT_FILE"
+        printf '---\n\n' >> "$COMMENT_FILE"
+
+        # ── Frontend section ─────────────────────────────────────────────────
+        printf '### Frontend\n\n' >> "$COMMENT_FILE"
+
+        if [ -f frontend-results.json ]; then
+          FE_SKIPPED=$(jq -r '.skipped // false' frontend-results.json)
+          FE_TOTAL=$(jq -r '.summary.total // 0' frontend-results.json)
+          FE_MAX=$(jq -r '.summary.maxTotal // 95' frontend-results.json)
+          FE_BONUS=$(jq -r '.summary.bonus // 0' frontend-results.json)
+          FE_GRAND=$(jq -r '.summary.grandTotal // 0' frontend-results.json)
+
+          if [ "$FE_SKIPPED" = "true" ]; then
+            printf 'Frontend: skipped (service not reachable)\n\n' >> "$COMMENT_FILE"
+          else
+            printf '**Frontend: %s/%s + %s bonus = %s**\n\n' \
+              "$FE_TOTAL" "$FE_MAX" "$FE_BONUS" "$FE_GRAND" >> "$COMMENT_FILE"
+            printf '| Trial | Score | Status |\n' >> "$COMMENT_FILE"
+            printf '|-------|-------|--------|\n' >> "$COMMENT_FILE"
+
+            jq -r '.trials[] | [.trial, .name, (.score|tostring), (.maxScore|tostring)] | @tsv' \
+              frontend-results.json | while IFS=$'\t' read -r TRIAL NAME SCORE MAX_SCORE; do
+              if [ "$SCORE" = "$MAX_SCORE" ]; then STATUS="PASS"; else STATUS="PARTIAL"; fi
+              printf '| %s — %s | %s/%s | %s |\n' "$TRIAL" "$NAME" "$SCORE" "$MAX_SCORE" "$STATUS" >> "$COMMENT_FILE"
+            done
+
+            FE_BOSS_PASSED=$(jq -r '.boss.passed // false' frontend-results.json)
+            FE_BOSS_DETAIL=$(jq -r '.boss.detail // ""' frontend-results.json)
+            if [ "$FE_BOSS_PASSED" = "true" ]; then FE_BOSS_STATUS="DEFEATED (+10)"; else FE_BOSS_STATUS="survived"; fi
+            printf '\nBoss (Lighthouse Sentinel): %s — %s\n' \
+              "$FE_BOSS_STATUS" "$FE_BOSS_DETAIL" >> "$COMMENT_FILE"
+          fi
+        else
+          printf 'Frontend: not evaluated\n' >> "$COMMENT_FILE"
+        fi
+
+        # ── Combined total ───────────────────────────────────────────────────
+        FE_GRAND=$(jq -r '.summary.grandTotal // 0' frontend-results.json 2>/dev/null || echo 0)
+        COMBINED=$((BE_GRAND + FE_GRAND))
+        printf '\n---\n\n' >> "$COMMENT_FILE"
+        printf '### Combined Grand Total: **%s**\n' "$COMBINED" >> "$COMMENT_FILE"
+
+        gh pr comment "${{ github.event.pull_request.number }}" \
+          --body-file "$COMMENT_FILE" \
+          --edit-last 2>/dev/null \
+          || gh pr comment "${{ github.event.pull_request.number }}" \
+             --body-file "$COMMENT_FILE"
+
+        rm -f "$COMMENT_FILE"
