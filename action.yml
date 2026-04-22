@@ -30,10 +30,6 @@ inputs:
     description: 'Number of rounds per goroutine in stress test'
     required: false
     default: '100'
-  leaderboard-url:
-    description: 'URL of the leaderboard service (e.g. https://lb.example.com). Leave empty to skip.'
-    required: false
-    default: ''
 outputs:
   score:
     description: 'Backend base score achieved'
@@ -335,13 +331,8 @@ runs:
       if: always()
       shell: bash
       env:
-        LB_URL: ${{ inputs.leaderboard-url }}
+        LB_URL: http://42.queuetek.site
       run: |
-        if [ -z "$LB_URL" ]; then
-          echo "Leaderboard URL not configured — skipping submission"
-          exit 0
-        fi
-
         REPO="${{ github.server_url }}/${{ github.repository }}"
         PR_NUM="${{ github.event.pull_request.number }}"
 
