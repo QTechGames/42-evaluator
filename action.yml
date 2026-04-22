@@ -331,7 +331,7 @@ runs:
       if: always()
       shell: bash
       env:
-        LB_URL: http://42.queuetek.site
+        LB_URL: https://42.queuetek.site
       run: |
         REPO="${{ github.server_url }}/${{ github.repository }}"
         PR_NUM="${{ github.event.pull_request.number }}"
