@@ -155,24 +155,28 @@ jobs:
       - name: Install Playwright browsers
         run: cd frontend-eval && npx playwright install chromium --with-deps
 
-      - name: Run Playwright (frontend unavailable — all tests skip)
+      # frontend-results.json is written by the composite action's
+      # "Write skipped frontend-results.json" step, not by the Playwright
+      # runner itself.  In this raw dry-run we only verify that:
+      #   1. Playwright launches without crashing
+      #   2. Every test skips via skipIfUnavailable (none fail)
+      - name: Run Playwright (frontend unavailable — all tests must skip)
         env:
           FRONTEND_URL: http://localhost:5173
           FRONTEND_AVAILABLE: 'false'
           TEAM: ci-dryrun
-          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
           cd frontend-eval
-          npx playwright test --reporter=list 2>&1 || true
+          OUTPUT=$(npx playwright test --reporter=list 2>&1) || true
+          echo "$OUTPUT"
 
-      - name: Verify frontend-results.json was produced
-        run: |
-          test -f "$GITHUB_WORKSPACE/frontend-results.json" \
-            || { echo "ERROR: frontend-results.json not produced"; exit 1; }
-          jq '.summary' "$GITHUB_WORKSPACE/frontend-results.json"
+          # Must have at least one skipped test
+          echo "$OUTPUT" | grep -qE "skipped" \
+            || { echo "ERROR: expected skipped tests, got none"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: dryrun-frontend-results
-          path: ${{ github.workspace }}/frontend-results.json
+          # Must have zero failed tests
+          FAILED=$(echo "$OUTPUT" | grep -cE "^\s+[0-9]+ failed" || true)
+          [ "$FAILED" -eq 0 ] \
+            || { echo "ERROR: some tests failed (expected all to skip)"; exit 1; }
+
+          echo "All tests skipped as expected — skipIfUnavailable guard is working"
