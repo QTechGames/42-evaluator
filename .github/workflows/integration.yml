@@ -1,0 +1,312 @@
+name: Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: 'Stress test goroutine count'
+        required: false
+        default: '20'
+      rounds:
+        description: 'Rounds per goroutine'
+        required: false
+        default: '50'
+      assert_min_score:
+        description: 'Minimum backend score to pass (0–95)'
+        required: false
+        default: '70'
+  schedule:
+    # Every Monday at 06:00 UTC
+    - cron: '0 6 * * 1'
+
+jobs:
+
+  # ── Backend integration ───────────────────────────────────────────────────
+  # Starts the Node.js mock backend (implements all 7 trials correctly),
+  # then exercises the composite action via `uses: ./`.
+  # Asserts that the backend score meets the configured threshold.
+
+  backend-integration:
+    name: Backend — action self-test against mock
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Start mock backend
+        env:
+          LAUNCH_SECRET: ${{ secrets.LAUNCH_SECRET || 'integration-test-secret' }}
+          PORT: '3000'
+        run: |
+          node .github/scripts/mock-backend.js &
+          echo "MOCK_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait until the server is accepting connections
+          for i in $(seq 1 15); do
+            if curl -sf http://localhost:3000/api/health > /dev/null 2>&1; then
+              echo "Mock backend ready after ${i}s"
+              break
+            fi
+            echo "Waiting for mock backend... (${i}/15)"
+            sleep 1
+          done
+
+          # Final check
+          curl -sf http://localhost:3000/api/health \
+            || { echo "ERROR: mock backend never became ready"; exit 1; }
+
+      - name: Verify health endpoint directly
+        run: |
+          RESP=$(curl -sf http://localhost:3000/api/health)
+          echo "Health response: $RESP"
+          echo "$RESP" | jq -e '.status == "ok"' > /dev/null \
+            || { echo "ERROR: unexpected health response"; exit 1; }
+
+      # ── Run the composite action against the mock ─────────────────────────
+      - name: Evaluate against mock backend
+        id: eval
+        uses: ./
+        with:
+          backend-url: 'http://localhost:3000'
+          frontend-url: 'http://localhost:5173'
+          fe-enabled: 'false'
+          team: 'integration-test'
+          launch-secret: ${{ secrets.LAUNCH_SECRET || 'integration-test-secret' }}
+          concurrency: ${{ inputs.concurrency || '20' }}
+          rounds: ${{ inputs.rounds || '50' }}
+
+      # ── Score assertions ──────────────────────────────────────────────────
+      - name: Assert backend score meets threshold
+        env:
+          SCORE: ${{ steps.eval.outputs.score }}
+          MAX_SCORE: ${{ steps.eval.outputs.max-score }}
+          GRAND_TOTAL: ${{ steps.eval.outputs.grand-total }}
+          MIN_SCORE: ${{ inputs.assert_min_score || '70' }}
+        run: |
+          echo "Backend score : $SCORE / $MAX_SCORE"
+          echo "Grand total   : $GRAND_TOTAL (includes bonus)"
+          echo "Min required  : $MIN_SCORE"
+
+          if [ "$SCORE" -lt "$MIN_SCORE" ]; then
+            echo "FAIL: score $SCORE is below minimum $MIN_SCORE"
+            exit 1
+          fi
+          echo "PASS: score $SCORE >= $MIN_SCORE"
+
+      - name: Assert results.json was produced
+        run: |
+          test -f results.json || { echo "ERROR: results.json missing"; exit 1; }
+          jq '{summary, boss: {name: .boss.name, passed: .boss.passed}}' results.json
+
+      - name: Print per-trial breakdown
+        if: always()
+        run: |
+          if [ -f results.json ]; then
+            echo "Trial breakdown:"
+            jq -r '.trials[] | "  \(.trial) — \(.name): \(.score)/\(.maxScore)"' results.json
+            echo ""
+            echo "Boss: $(jq -r '.boss.name' results.json) — passed=$(jq -r '.boss.passed' results.json)"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-results
+          path: results.json
+
+      - name: Stop mock backend
+        if: always()
+        run: |
+          if [ -n "$MOCK_PID" ]; then
+            kill "$MOCK_PID" 2>/dev/null || true
+          fi
+
+  # ── Full action integration (backend + frontend) ──────────────────────────
+  # Runs the full composite action with a live frontend (the reference
+  # frontend from the parent repo, served as a static build).
+  # Frontend is optional — the job passes even if FE scores 0.
+
+  full-action:
+    name: Full action — backend + frontend
+    runs-on: ubuntu-latest
+    needs: backend-integration   # only run if backend integration passes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # Start mock backend on 3000
+      - name: Start mock backend
+        run: |
+          node .github/scripts/mock-backend.js &
+          echo "MOCK_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:3000/api/health > /dev/null 2>&1 && break || sleep 1
+          done
+          curl -sf http://localhost:3000/api/health \
+            || { echo "ERROR: mock backend never ready"; exit 1; }
+
+      # Serve a minimal frontend stub on 5173.
+      # It has all required data-testid attributes and fetches from the
+      # mock backend, giving Trial I (FE) + partial Trial II (FE) coverage.
+      - name: Build and serve minimal frontend stub
+        run: |
+          mkdir -p /tmp/frontend-stub
+
+          cat > /tmp/frontend-stub/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>42-Challenge Mock Frontend</title>
+          </head>
+          <body>
+            <header><h1>42-Challenge Casino</h1></header>
+            <main>
+              <input data-testid="search-input" type="text" placeholder="Search games" aria-label="Search games">
+              <select data-testid="category-filter" aria-label="Category filter">
+                <option value="">All categories</option>
+                <option value="slots">Slots</option>
+                <option value="table">Table</option>
+                <option value="live">Live</option>
+              </select>
+              <select data-testid="provider-filter" aria-label="Provider filter">
+                <option value="">All providers</option>
+              </select>
+              <div id="games-grid" aria-label="Games"></div>
+              <div data-testid="loading" hidden aria-live="polite">Loading…</div>
+              <div data-testid="error-message" hidden role="alert"></div>
+              <div data-testid="empty-state" hidden>No games found</div>
+              <nav aria-label="Pagination">
+                <button>Prev</button>
+                <button>Next</button>
+              </nav>
+            </main>
+            <script>
+              const BACKEND = 'http://localhost:3000';
+              async function loadGames() {
+                const loading = document.querySelector('[data-testid="loading"]');
+                const grid = document.getElementById('games-grid');
+                loading.hidden = false;
+                try {
+                  const r = await fetch(BACKEND + '/api/games?limit=20');
+                  const data = await r.json();
+                  loading.hidden = true;
+                  if (!data.games || data.games.length === 0) {
+                    document.querySelector('[data-testid="empty-state"]').hidden = false;
+                    return;
+                  }
+                  grid.innerHTML = data.games.map(g => `
+                    <div data-testid="game-card" data-id="${g.id}" tabindex="0" role="button"
+                         aria-label="${g.name}" style="cursor:pointer"
+                         onclick="openGame('${g.id}')">
+                      <img src="${g.thumbnail}" alt="${g.name}" width="80" height="60">
+                      <div>${g.name}</div>
+                      <div>${g.provider}</div>
+                      <div>${g.category}</div>
+                    </div>
+                  `).join('');
+                } catch (e) {
+                  loading.hidden = true;
+                  const err = document.querySelector('[data-testid="error-message"]');
+                  err.hidden = false;
+                  err.textContent = 'Failed to load games. ' + e.message;
+                }
+              }
+              function openGame(id) {
+                window.location.hash = '#/games/' + id;
+                renderDetail(id);
+              }
+              async function renderDetail(id) {
+                document.getElementById('games-grid').innerHTML = `
+                  <div data-testid="game-detail">
+                    <a href="#" onclick="window.location.hash='';loadGames();return false">← Back</a>
+                    <div id="detail-${id}">Loading…</div>
+                    <button data-testid="launch-button">Launch</button>
+                    <div data-testid="mode-selector">
+                      <label><input type="radio" name="mode" value="demo" checked> Demo</label>
+                      <label><input type="radio" name="mode" value="real"> Real</label>
+                    </div>
+                  </div>`;
+                const r = await fetch(BACKEND + '/api/games/' + id);
+                const g = await r.json();
+                document.getElementById('detail-' + id).innerHTML =
+                  `<h2>${g.name}</h2><p>${g.provider} — ${g.category}</p>
+                   <p>RTP: ${g.rtp}%  Volatility: ${g.volatility}</p>
+                   <p>Enabled: ${g.enabled}</p>`;
+              }
+              loadGames();
+            </script>
+          </body>
+          </html>
+          EOF
+
+          # Serve with Python (available on all ubuntu-latest runners)
+          cd /tmp/frontend-stub
+          python3 -m http.server 5173 &
+          echo "FRONTEND_PID=$!" >> "$GITHUB_ENV"
+          sleep 2
+          curl -sf http://localhost:5173/ > /dev/null \
+            || { echo "ERROR: frontend stub never ready"; exit 1; }
+          echo "Frontend stub ready on http://localhost:5173"
+
+      # ── Run the full composite action ─────────────────────────────────────
+      - name: Run full evaluator action
+        id: eval
+        uses: ./
+        with:
+          backend-url: 'http://localhost:3000'
+          frontend-url: 'http://localhost:5173'
+          fe-enabled: 'true'
+          team: 'integration-full'
+          launch-secret: ${{ secrets.LAUNCH_SECRET || 'integration-test-secret' }}
+          concurrency: ${{ inputs.concurrency || '20' }}
+          rounds: ${{ inputs.rounds || '50' }}
+
+      # ── Print combined results ────────────────────────────────────────────
+      - name: Print combined score
+        if: always()
+        run: |
+          echo "=== Backend ==="
+          echo "  score      : ${{ steps.eval.outputs.score }} / ${{ steps.eval.outputs.max-score }}"
+          echo "  bonus      : ${{ steps.eval.outputs.bonus }}"
+          echo "  grand total: ${{ steps.eval.outputs.grand-total }}"
+          echo ""
+          echo "=== Frontend ==="
+          echo "  score      : ${{ steps.eval.outputs.fe-score }} / ${{ steps.eval.outputs.fe-max-score }}"
+          echo "  bonus      : ${{ steps.eval.outputs.fe-bonus }}"
+          echo "  grand total: ${{ steps.eval.outputs.fe-grand-total }}"
+          echo ""
+          COMBINED=$(( ${{ steps.eval.outputs.grand-total }} + ${{ steps.eval.outputs.fe-grand-total }} ))
+          echo "=== Combined grand total: $COMBINED ==="
+
+      - name: Backend score must still pass threshold
+        env:
+          SCORE: ${{ steps.eval.outputs.score }}
+          MIN_SCORE: ${{ inputs.assert_min_score || '70' }}
+        run: |
+          [ "$SCORE" -ge "$MIN_SCORE" ] \
+            || { echo "FAIL: backend score $SCORE < $MIN_SCORE"; exit 1; }
+          echo "PASS: backend $SCORE >= $MIN_SCORE"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-integration-results
+          path: |
+            results.json
+            frontend-results.json
+
+      - name: Stop servers
+        if: always()
+        run: |
+          [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+          [ -n "$FRONTEND_PID" ] && kill "$FRONTEND_PID" 2>/dev/null || true

@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+
+  # ── Validate action.yml + binary ──────────────────────────────────────────
+
+  validate:
+    name: Validate action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate action.yml is parseable YAML
+        run: python3 -c "import yaml, sys; yaml.safe_load(open('action.yml')); print('action.yml OK')"
+
+      - name: Evaluator binary exists and is ELF
+        run: |
+          test -f evaluator || { echo "ERROR: evaluator binary missing"; exit 1; }
+          chmod +x evaluator
+          file evaluator | grep -qiE "ELF|executable" || { echo "ERROR: evaluator is not an executable binary"; exit 1; }
+          echo "evaluator binary OK: $(file evaluator)"
+
+      - name: Frontend-eval directory is intact
+        run: |
+          test -f frontend-eval/package.json       || { echo "ERROR: package.json missing"; exit 1; }
+          test -f frontend-eval/playwright.config.ts || { echo "ERROR: playwright.config.ts missing"; exit 1; }
+          test -d frontend-eval/tests               || { echo "ERROR: tests/ directory missing"; exit 1; }
+          echo "frontend-eval structure OK"
+
+  # ── TypeScript type-check for frontend-eval ───────────────────────────────
+
+  typecheck:
+    name: Type-check frontend-eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend-eval/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend-eval && npm ci
+
+      - name: TypeScript check
+        run: cd frontend-eval && npx tsc --noEmit
+
+  # ── Smoke-test the evaluator binary ───────────────────────────────────────
+
+  test-evaluator-smoke:
+    name: Evaluator binary smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Minimal HTTP server — returns 404 for everything.
+      # We only care that the binary runs, doesn't crash,
+      # and writes a structurally valid results.json.
+      - name: Start stub backend (HTTP 404 server)
+        run: |
+          python3 -c "
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(404)
+                  self.end_headers()
+              def do_POST(self):
+                  self.send_response(404)
+                  self.end_headers()
+              def log_message(self, *a): pass
+          HTTPServer(('', 3000), H).serve_forever()
+          " &
+          sleep 1
+
+      - name: Run evaluator binary
+        run: |
+          chmod +x evaluator
+          ./evaluator \
+            -url http://localhost:3000 \
+            -team ci-smoke \
+            -concurrency 5 \
+            -rounds 10 \
+            -output results.json || true
+
+      - name: Validate results.json structure
+        run: |
+          test -f results.json || { echo "ERROR: results.json not produced"; exit 1; }
+
+          # Required top-level keys
+          jq -e '.summary | has("total")' results.json > /dev/null
+          jq -e '.summary | has("maxTotal")' results.json > /dev/null
+          jq -e '.summary | has("bonus")' results.json > /dev/null
+          jq -e '.summary | has("grandTotal")' results.json > /dev/null
+          jq -e '.trials | type == "array"' results.json > /dev/null
+          jq -e '.boss | has("passed")' results.json > /dev/null
+
+          # maxTotal must be 95 (7 backend trials)
+          MAX=$(jq -r '.summary.maxTotal' results.json)
+          [ "$MAX" -eq 95 ] || { echo "ERROR: expected maxTotal=95, got $MAX"; exit 1; }
+
+          echo "results.json structure valid"
+          jq '{summary: .summary, trials: [.trials[] | {trial: .trial, name: .name, score: .score, max: .maxScore}], boss: {name: .boss.name, passed: .boss.passed}}' results.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-results
+          path: results.json
+
+  # ── Playwright dry-run (FRONTEND_AVAILABLE=false → all skip gracefully) ───
+
+  test-playwright-dryrun:
+    name: Playwright tests dry-run (no frontend)
+    runs-on: ubuntu-latest
+    needs: typecheck
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend-eval/package-lock.json
+
+      - name: Install dependencies
+        run: cd frontend-eval && npm ci
+
+      - name: Install Playwright browsers
+        run: cd frontend-eval && npx playwright install chromium --with-deps
+
+      - name: Run Playwright (frontend unavailable — all tests skip)
+        env:
+          FRONTEND_URL: http://localhost:5173
+          FRONTEND_AVAILABLE: 'false'
+          TEAM: ci-dryrun
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+        run: |
+          cd frontend-eval
+          npx playwright test --reporter=list 2>&1 || true
+
+      - name: Verify frontend-results.json was produced
+        run: |
+          test -f "$GITHUB_WORKSPACE/frontend-results.json" \
+            || { echo "ERROR: frontend-results.json not produced"; exit 1; }
+          jq '.summary' "$GITHUB_WORKSPACE/frontend-results.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dryrun-frontend-results
+          path: ${{ github.workspace }}/frontend-results.json
